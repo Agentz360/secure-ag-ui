@@ -1,8 +1,9 @@
 # src/adk_agent.py
 
 """Main ADKAgent implementation for bridging AG-UI Protocol with Google ADK."""
+from ag_ui_adk.agui_toolset import AGUIToolset
 
-from typing import Optional, Dict, Callable, Any, AsyncGenerator, List, Iterable, TYPE_CHECKING, Tuple
+from typing import Optional, Dict, Callable, Any, AsyncGenerator, List, Iterable, TYPE_CHECKING, Tuple, Union
 
 if TYPE_CHECKING:
     from google.adk.apps import App
@@ -20,8 +21,9 @@ from ag_ui.core import (
 )
 
 from google.adk import Runner
-from google.adk.agents import BaseAgent, RunConfig as ADKRunConfig
+from google.adk.agents import BaseAgent, LlmAgent, RunConfig as ADKRunConfig
 from google.adk.agents.run_config import StreamingMode
+from google.adk.agents.llm_agent import InstructionProvider, ToolUnion
 from google.adk.sessions import BaseSessionService, InMemorySessionService
 from google.adk.artifacts import BaseArtifactService, InMemoryArtifactService
 from google.adk.memory import BaseMemoryService, InMemoryMemoryService
@@ -30,7 +32,7 @@ from google.adk.auth.credential_service.in_memory_credential_service import InMe
 from google.genai import types
 
 from .event_translator import EventTranslator, adk_events_to_messages
-from .session_manager import SessionManager
+from .session_manager import SessionManager, CONTEXT_STATE_KEY
 from .execution_state import ExecutionState
 from .client_proxy_toolset import ClientProxyToolset
 from .config import PredictStateMapping
@@ -77,6 +79,9 @@ class ADKAgent:
 
         # Session cleanup configuration
         cleanup_interval_seconds: int = 300,  # 5 minutes default
+        max_sessions_per_user: Optional[int] = None,    # No limit by default
+        delete_session_on_cleanup: bool = True,
+        save_session_to_memory_on_cleanup: bool = True,
 
         # Predictive state configuration
         predict_state: Optional[Iterable[PredictStateMapping]] = None,
@@ -102,6 +107,9 @@ class ADKAgent:
             tool_timeout_seconds: Timeout for individual tool calls
             max_concurrent_executions: Maximum concurrent background executions
             cleanup_interval_seconds: Interval for session cleanup
+            max_sessions_per_user: Maximum concurrent sessions per user (None = unlimited)
+            delete_session_on_cleanup: Whether to delete sessions from the adk SessionService on session cache cleanup
+            save_session_to_memory_on_cleanup: Whether to save sessions to the adk MemoryService on session cache cleanup
             predict_state: Configuration for predictive state updates. When provided,
                 the agent will emit PredictState CustomEvents for matching tool calls,
                 enabling the UI to show state changes in real-time as tool arguments
@@ -113,6 +121,9 @@ class ADKAgent:
                 full message history (e.g., for client-side persistence or AG-UI
                 protocol compliance). Note: Clients using CopilotKit can use the
                 /agents/state endpoint instead for on-demand history retrieval.
+
+            Note:
+            If delete_session_on_cleanup=False but save_session_to_memory_on_cleanup=True, sessions will accumulate in SessionService but still be saved to memory on cleanup.
         """
         if app_name and app_name_extractor:
             raise ValueError("Cannot specify both 'app_name' and 'app_name_extractor'")
@@ -151,8 +162,9 @@ class ADKAgent:
             memory_service=self._memory_service,  # Pass memory service for automatic session memory
             session_timeout_seconds=session_timeout_seconds,  # 20 minutes default
             cleanup_interval_seconds=cleanup_interval_seconds,
-            max_sessions_per_user=None,    # No limit by default
-            auto_cleanup=True              # Enable by default
+            max_sessions_per_user=max_sessions_per_user,
+            delete_session_on_cleanup=delete_session_on_cleanup,
+            save_session_to_memory_on_cleanup=save_session_to_memory_on_cleanup
         )
         
         # Tool execution tracking
@@ -204,6 +216,9 @@ class ADKAgent:
         # Session management
         session_timeout_seconds: Optional[int] = 1200,
         cleanup_interval_seconds: int = 300,
+        max_sessions_per_user: Optional[int] = None,    # No limit by default
+        delete_session_on_cleanup: bool = True,
+        save_session_to_memory_on_cleanup: bool = True,
         # AG-UI specific
         predict_state: Optional[Iterable[PredictStateMapping]] = None,
         emit_messages_snapshot: bool = False,
@@ -275,6 +290,9 @@ class ADKAgent:
             max_concurrent_executions=max_concurrent_executions,
             session_timeout_seconds=session_timeout_seconds,
             cleanup_interval_seconds=cleanup_interval_seconds,
+            max_sessions_per_user=max_sessions_per_user,
+            delete_session_on_cleanup=delete_session_on_cleanup,
+            save_session_to_memory_on_cleanup=save_session_to_memory_on_cleanup,
             predict_state=predict_state,
             emit_messages_snapshot=emit_messages_snapshot,
         )
@@ -465,13 +483,44 @@ class ADKAgent:
     
     
     def _default_run_config(self, input: RunAgentInput) -> ADKRunConfig:
-        """Create default RunConfig with SSE streaming enabled."""
-        return ADKRunConfig(
-            streaming_mode=StreamingMode.SSE,
-            save_input_blobs_as_artifacts=True
-        )
-    
-    
+        """Create default RunConfig with SSE streaming enabled.
+
+        Context from RunAgentInput is always stored in session state under the
+        '_ag_ui_context' key (CONTEXT_STATE_KEY), making it accessible to both
+        tools (via tool_context.state) and instruction providers (via ctx.state).
+
+        Additionally, for ADK 1.22.0+, context is also included in RunConfig's
+        custom_metadata field, providing an alternative access pattern via
+        ctx.run_config.custom_metadata['ag_ui_context'].
+        """
+        config_kwargs = {
+            'streaming_mode': StreamingMode.SSE,
+            'save_input_blobs_as_artifacts': True,
+        }
+
+        # For ADK 1.22.0+, also include context in custom_metadata
+        if self._run_config_supports_custom_metadata() and input.context:
+            config_kwargs['custom_metadata'] = {
+                'ag_ui_context': [
+                    {"description": ctx.description, "value": ctx.value}
+                    for ctx in input.context
+                ]
+            }
+
+        return ADKRunConfig(**config_kwargs)
+
+    def _run_config_supports_custom_metadata(self) -> bool:
+        """Check if the installed ADK version supports custom_metadata in RunConfig.
+
+        The custom_metadata parameter was added to RunConfig in ADK 1.22.0.
+        This method checks for its presence to maintain backward compatibility.
+
+        Returns:
+            True if RunConfig accepts custom_metadata, False otherwise
+        """
+        sig = inspect.signature(ADKRunConfig.__init__)
+        return 'custom_metadata' in sig.parameters
+
     def _runner_supports_plugin_close_timeout(self) -> bool:
         """Check if the installed ADK version supports plugin_close_timeout.
 
@@ -1225,17 +1274,14 @@ class ADKAgent:
         user_id = self._get_user_id(input)
         app_name = self._get_app_name(input)
         
-        # Use the ADK agent directly
-        adk_agent = self._adk_agent
-        
-        # Prepare agent modifications (SystemMessage and tools)
-        agent_updates = {}
-        
+        # Use a deep copy of the ADK agent so we can modify it per-execution
+        adk_agent = self._adk_agent.model_copy(deep=True)
+
         # Handle SystemMessage if it's the first message - append to agent instructions
         if input.messages and isinstance(input.messages[0], SystemMessage):
             system_content = input.messages[0].content
-            if system_content:
-                current_instruction = getattr(adk_agent, 'instruction', '') or ''
+            if system_content and isinstance(adk_agent, LlmAgent):
+                current_instruction = adk_agent.instruction
 
                 if callable(current_instruction):
                     # Handle instructions provider
@@ -1268,40 +1314,39 @@ class ADKAgent:
                         new_instruction = system_content
                     logger.debug(f"Will append SystemMessage to string instructions: '{system_content[:100]}...'")
 
-                agent_updates['instruction'] = new_instruction
+                adk_agent.instruction = new_instruction
 
-        # Create dynamic toolset if tools provided and prepare tool updates
-        toolset = None
-        if input.tools:
-            # Get existing tools from the agent
-            existing_tools = []
-            if hasattr(adk_agent, 'tools') and adk_agent.tools:
-                existing_tools = list(adk_agent.tools) if isinstance(adk_agent.tools, (list, tuple)) else [adk_agent.tools]
-            
-            # if same tool is defined in frontend and backend then agent will only use the backend tool
-            input_tools = []
-            for input_tool in input.tools:
-                # Check if this input tool's name matches any existing tool
-                # Also exclude this specific tool call "transfer_to_agent" which is used internally by the adk to handoff to other agents
-                if (not any(hasattr(existing_tool, '__name__') and input_tool.name == existing_tool.__name__
-                        for existing_tool in existing_tools) and input_tool.name != 'transfer_to_agent'):
-                    input_tools.append(input_tool)
-                        
-            toolset = ClientProxyToolset(
-                ag_ui_tools=input_tools,
-                event_queue=event_queue
-            )
+        def _update_agent_tools_recursive(agent: Any) -> None:
+            """
+            Recursively replace AGUIToolset with ClientProxyToolset for an agent and its sub-agents.
+            Args:
+                agent: Agent instance to process
+            """
+            if isinstance(agent, LlmAgent) and hasattr(agent, "tools"):
+                new_tools: list[ToolUnion] = []
+                for tool in agent.tools:
+                    if isinstance(tool, AGUIToolset):
+                        tool = ClientProxyToolset(
+                            ag_ui_tools=input.tools,
+                            event_queue=event_queue,
+                            tool_filter=tool.tool_filter,
+                            tool_name_prefix=tool.tool_name_prefix,
+                        )
+                        logger.debug(
+                            f"Replaced AGUIToolset with ClientProxyToolset for agent {agent.name}"
+                        )
+                    new_tools.append(tool)
 
-            # Combine existing tools with our proxy toolset
-            combined_tools = existing_tools + [toolset]
-            agent_updates['tools'] = combined_tools
-            logger.debug(f"Will combine {len(existing_tools)} existing tools with proxy toolset")
-        
-        # Create a single copy of the agent with all updates if any modifications needed
-        if agent_updates:
-            adk_agent = adk_agent.model_copy(update=agent_updates)
-            logger.debug(f"Created modified agent copy with updates: {list(agent_updates.keys())}")
-        
+                agent.tools = new_tools
+
+                # Recursively process sub-agents if they exist
+                if hasattr(agent, "sub_agents") and agent.sub_agents:
+                    for sub_agent in agent.sub_agents:
+                        if isinstance(sub_agent, LlmAgent):
+                            _update_agent_tools_recursive(sub_agent)
+
+        _update_agent_tools_recursive(adk_agent)
+
         # Create background task
         logger.debug(f"Creating background task for thread {input.thread_id}")
         run_kwargs = {
@@ -1363,14 +1408,36 @@ class ADKAgent:
             # Create RunConfig
             run_config = self._run_config_factory(input)
 
+            # Prepare state with context included
+            # Context from RunAgentInput is stored under _ag_ui_context key,
+            # making it accessible via tool_context.state['_ag_ui_context']
+            state_with_context = dict(input.state) if input.state else {}
+            if input.context:
+                state_with_context[CONTEXT_STATE_KEY] = [
+                    {"description": ctx.description, "value": ctx.value}
+                    for ctx in input.context
+                ]
+
             # Ensure session exists and get backend session_id
             session, backend_session_id = await self._ensure_session_exists(
-                app_name, user_id, input.thread_id, input.state
+                app_name, user_id, input.thread_id, state_with_context
             )
 
             # this will always update the backend states with the frontend states
             # Recipe Demo Example: if there is a state "salt" in the ingredients state and in frontend user remove this salt state using UI from the ingredients list then our backend should also update these state changes as well to sync both the states
-            await self._session_manager.update_session_state(backend_session_id, app_name, user_id, input.state)
+            await self._session_manager.update_session_state(backend_session_id, app_name, user_id, state_with_context)
+
+            # Refresh session to get updated last_update_time after state update
+            # This prevents "stale session" errors when using DatabaseSessionService
+            # See: https://github.com/ag-ui-protocol/ag-ui/issues/957
+            refreshed_session = await self._session_manager.get_session(backend_session_id, app_name, user_id)
+            if refreshed_session:
+                session = refreshed_session
+            else:
+                logger.warning(
+                    f"Failed to refresh session {backend_session_id} after state update. "
+                    "Continuing with potentially stale session."
+                )
 
             # Convert messages
             unseen_messages = message_batch if message_batch is not None else await self._get_unseen_messages(input)
@@ -1445,7 +1512,8 @@ class ADKAgent:
                 function_response_event = Event(
                     timestamp=time.time(),
                     author='user',
-                    content=function_response_content
+                    content=function_response_content,
+                    invocation_id=input.run_id,
                 )
 
                 await self._session_manager._session_service.append_event(session, function_response_event)
@@ -1495,7 +1563,21 @@ class ADKAgent:
                     )
                     function_response_parts.append(updated_function_response_part)
 
-                new_message = types.Content(parts=function_response_parts, role='user')
+                # Persist FunctionResponse event so DatabaseSessionService has invocation_id
+                from google.adk.sessions.session import Event
+                import time
+
+                function_response_content = types.Content(parts=function_response_parts, role='user')
+                function_response_event = Event(
+                    timestamp=time.time(),
+                    author='user',
+                    content=function_response_content,
+                    invocation_id=input.run_id,
+                )
+
+                await self._session_manager._session_service.append_event(session, function_response_event)
+
+                new_message = function_response_content
             else:
                 # No tool results, just use the user message
                 # If user_message is None (e.g., unseen_messages was empty because all were
