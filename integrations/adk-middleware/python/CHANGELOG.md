@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-02-16
+
 ### Added
 
 - **NEW**: Streaming function call arguments support for Gemini 3+ models via Vertex AI (#822)
@@ -45,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **FIXED**: Thought parts separated from text in message history (#1110, #1118, #1124)
+  - `adk_events_to_messages()` was concatenating thought parts (Part.thought=True) with regular text into a single AssistantMessage.content string, causing internal model reasoning to leak into the visible chat when users reloaded sessions
+  - Thought parts are now emitted as ReasoningMessage (role="reasoning") before the AssistantMessage, matching the live streaming behavior where THINKING_* events are already separated from TEXT_MESSAGE events
+  - Thanks to **@lakshminarasimmanv** for identifying and fixing this issue!
 - **FIXED**: Duplicate function_response events when using LongRunningFunctionTool (#1074, #1075)
   - Eliminated duplicate function_response events that were persisted to session database with different invocation_ids
   - Fix works for all agent types (simple LlmAgent and composite SequentialAgent/LoopAgent)
